@@ -95,6 +95,8 @@ class CapsuleService : NotificationListenerService() {
     private var chargeVolts = 0.0
     private var chargeMa: Int? = null
     private var chargeWatts: Double? = null
+    private val chargeRateSamples = mutableListOf<Pair<Long, Int>>()
+    private var lastChargeSampleAt = 0L
     private lateinit var navBox: LinearLayout         // expanded navigation pill
     private lateinit var navArrow: ImageView
     private lateinit var navTurn: TextView
@@ -1016,24 +1018,25 @@ class CapsuleService : NotificationListenerService() {
         }
     }
 
-    // Background blur for the pill window (Android 12+). The window is only asked for blur;
-    // Android decides whether it shows, so the result is written to Diagnostics.
+    // Background blur for overlay windows on Android 12+. Overlay windows use
+    // the blur-behind setter on LayoutParams.
     private fun applyBlur() {
-        val radius = prefs.getInt("blurRadius", 40)
+        val radius = prefs.getInt("blurRadius", 40).coerceIn(1, 100)
         if (Build.VERSION.SDK_INT < 31) {
             diag("blur: needs Android 12 or newer")
             return
         }
         runCatching {
-            val m = WindowManager.LayoutParams::class.java.getMethod(
-                "setBackgroundBlurRadius", Int::class.javaPrimitiveType
-            )
-            m.invoke(lp, radius.coerceIn(1, 100))
-            lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
+            WindowManager.LayoutParams::class.java
+                .getMethod("setBlurBehindRadius", Int::class.javaPrimitiveType)
+                .invoke(lp, radius)
+            lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND or
+                WindowManager.LayoutParams.FLAG_DIM_BEHIND
+            lp.dimAmount = 0.04f
         }.onSuccess {
-            diag("blur: requested, radius $radius")
+            diag("blur: blur-behind requested, radius $radius; compositor support still required")
         }.onFailure {
-            diag("blur: not available here (${it.javaClass.simpleName})")
+            diag("blur: setBlurBehindRadius unavailable (${it.javaClass.simpleName})")
         }
     }
 
@@ -2175,15 +2178,22 @@ class CapsuleService : NotificationListenerService() {
         setStroke(dp(1), 0x22FFFFFF)
     }
 
-    // Asks the panel window for background blur (Android 12+); the result is logged
+    // Requests blur behind the floating control panel using the overlay-window API.
     private fun blurParams(params: WindowManager.LayoutParams, radius: Int) {
-        val ok = runCatching {
+        if (Build.VERSION.SDK_INT < 31) {
+            diag("panel blur: needs Android 12 or newer")
+            return
+        }
+        val result = runCatching {
             WindowManager.LayoutParams::class.java
-                .getMethod("setBackgroundBlurRadius", Int::class.javaPrimitiveType)
+                .getMethod("setBlurBehindRadius", Int::class.javaPrimitiveType)
                 .invoke(params, radius.coerceIn(1, 100))
-            params.flags = params.flags and WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
-        }.isSuccess
-        diag(if (ok) "panel blur: requested, radius $radius" else "panel blur: not available here")
+            params.flags = params.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND or
+                WindowManager.LayoutParams.FLAG_DIM_BEHIND
+            params.dimAmount = 0.04f
+        }
+        diag(if (result.isSuccess) "panel blur: blur-behind requested, radius $radius" else
+            "panel blur: setBlurBehindRadius unavailable (${result.exceptionOrNull()?.javaClass?.simpleName})")
     }
 
     private fun panelCols() = prefs.getInt("panelCols", 4).coerceIn(4, 7)
@@ -3381,14 +3391,19 @@ class CapsuleService : NotificationListenerService() {
         }
     }
 
-    // Current in microamps, or null if no method gave a real (non-zero) value
-    private fun readCurrentUa(intent: Intent? = null): Int? {
+    // Current is normalized to microamps. Some Xiaomi builds return CURRENT_NOW in
+    // milliamps despite Android's documented microamp unit; detect that implausibly
+    // small reading during active charging and normalize it before calculating watts.
+    private fun readCurrentUa(intent: Intent? = null, isCharging: Boolean = charging, pct: Int = chargePct): Long? {
         val bm = getSystemService(BatteryManager::class.java)
         val fromApi = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
-        if (fromApi != Int.MIN_VALUE && fromApi != 0) return fromApi
+        if (fromApi != Int.MIN_VALUE && fromApi != 0) {
+            val raw = fromApi.toLong()
+            return if (isCharging && pct < 95 && abs(raw) in 1L..9999L) raw * 1000L else raw
+        }
         // Some OEMs publish current on ACTION_BATTERY_CHANGED even when the API property is empty.
-        val fromIntent = intent?.getIntExtra("current_now", 0) ?: 0
-        if (fromIntent != 0) return fromIntent
+        val fromIntent = intent?.getIntExtra("current_now", 0)?.toLong() ?: 0L
+        if (fromIntent != 0L) return fromIntent
 
         // Vendors expose live current under different power-supply nodes.
         val dir = File("/sys/class/power_supply")
@@ -3397,13 +3412,52 @@ class CapsuleService : NotificationListenerService() {
             val base = File(dir, name)
             val type = runCatching { File(base, "type").readText().trim() }.getOrNull()
             if (type !in setOf("Battery", "USB", "Mains", "Wireless", "USB_PD")) continue
-            val v = runCatching { File(base, "current_now").readText().trim().toInt() }.getOrNull()
-            if (v != null && v != 0) return v
-            val avg = runCatching { File(base, "current_avg").readText().trim().toInt() }.getOrNull()
-            if (avg != null && avg != 0) return avg
+            val v = runCatching { File(base, "current_now").readText().trim().toLong() }.getOrNull()
+            if (v != null && v != 0L) return v
+            val avg = runCatching { File(base, "current_avg").readText().trim().toLong() }.getOrNull()
+            if (avg != null && avg != 0L) return avg
         }
         return null
     }
+
+    private fun updateChargeEta(now: Long, platformEtaMs: Long) {
+        if (!charging) {
+            chargeRateSamples.clear()
+            lastChargeSampleAt = 0L
+            chargeEta = "ETA —"
+            return
+        }
+        if (lastChargeSampleAt == 0L || now - lastChargeSampleAt >= 30_000L) {
+            chargeRateSamples.add(now to chargePct)
+            lastChargeSampleAt = now
+        }
+        while (chargeRateSamples.isNotEmpty() && now - chargeRateSamples.first().first > 30 * 60_000L) {
+            chargeRateSamples.removeAt(0)
+        }
+
+        if (platformEtaMs > 0L) {
+            chargeEta = formatChargeEta(platformEtaMs / 60_000L)
+            return
+        }
+        val first = chargeRateSamples.firstOrNull()
+        val last = chargeRateSamples.lastOrNull()
+        if (first != null && last != null) {
+            val elapsedMs = last.first - first.first
+            val gainedPct = last.second - first.second
+            if (elapsedMs >= 90_000L && gainedPct > 0 && chargePct < 100) {
+                val pctPerHour = gainedPct * 3_600_000.0 / elapsedMs
+                val minutes = (((100 - chargePct) / pctPerHour) * 60.0).toLong()
+                if (minutes in 1L..(48L * 60L)) {
+                    chargeEta = formatChargeEta(minutes)
+                    return
+                }
+            }
+        }
+        chargeEta = "ETA —"
+    }
+
+    private fun formatChargeEta(minutes: Long): String =
+        if (minutes >= 60L) "ETA ${minutes / 60}h ${minutes % 60}m" else "ETA ${minutes}m"
 
     private fun handleBattery(i: Intent) {
         val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
@@ -3440,23 +3494,20 @@ class CapsuleService : NotificationListenerService() {
         }
 
         val parts = mutableListOf(source)
-        val currentUa = readCurrentUa(i)
+        val currentUa = readCurrentUa(i, charging, chargePct)
         chargeVolts = voltageMv / 1000.0
-        chargeMa = currentUa?.let { (Math.abs(it.toLong()) / 1000L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt() }
-        chargeWatts = if (currentUa != null && voltageMv > 0) Math.abs(voltageMv.toDouble() * currentUa.toDouble()) / 1e9 else null
+        chargeMa = currentUa?.let { (abs(it) / 1000L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt() }
+        chargeWatts = if (currentUa != null && voltageMv > 0) abs(voltageMv.toDouble() * currentUa.toDouble()) / 1e9 else null
         if (currentUa != null) {
-            val mA = Math.abs(currentUa) / 1000
-            val watts = Math.abs(voltageMv.toDouble() * currentUa.toDouble()) / 1e9
+            val mA = abs(currentUa) / 1000L
+            val watts = abs(voltageMv.toDouble() * currentUa.toDouble()) / 1e9
             parts.add("$mA mA")
             parts.add("%.1f W".format(watts))
         }
         parts.add("%.2f V".format(voltageMv / 1000.0))
         parts.add("%.1f\u00B0C".format(tempC))
         val ttf = getSystemService(BatteryManager::class.java).computeChargeTimeRemaining()
-        chargeEta = if (charging && ttf > 0) {
-            val mins = ttf / 60000L
-            if (mins >= 60) "ETA ${mins / 60}h ${mins % 60}m" else "ETA ${mins}m"
-        } else "ETA —"
+        updateChargeEta(SystemClock.elapsedRealtime(), ttf)
         if (ttf > 0) parts.add("full in ${ttf / 60000} min")
         chargeDetail = parts.joinToString(" \u00B7 ")
         diag("battery: charging=$charging pct=$chargePct current=${currentUa ?: "unavailable"}uA voltage=${voltageMv}mV")
