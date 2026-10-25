@@ -1018,26 +1018,13 @@ class CapsuleService : NotificationListenerService() {
         }
     }
 
-    // Background blur for overlay windows on Android 12+. Overlay windows use
-    // the blur-behind setter on LayoutParams.
+    // Avoid global blur-behind: some OEMs blur the entire screen behind overlays.
+    // Keep the existing translucent theme background instead.
     private fun applyBlur() {
-        val radius = prefs.getInt("blurRadius", 40).coerceIn(1, 100)
-        if (Build.VERSION.SDK_INT < 31) {
-            diag("blur: needs Android 12 or newer")
-            return
-        }
-        runCatching {
-            WindowManager.LayoutParams::class.java
-                .getMethod("setBlurBehindRadius", Int::class.javaPrimitiveType)
-                .invoke(lp, radius)
-            lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND or
-                WindowManager.LayoutParams.FLAG_DIM_BEHIND
-            lp.dimAmount = 0.04f
-        }.onSuccess {
-            diag("blur: blur-behind requested, radius $radius; compositor support still required")
-        }.onFailure {
-            diag("blur: setBlurBehindRadius unavailable (${it.javaClass.simpleName})")
-        }
+        lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
+        lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_DIM_BEHIND.inv()
+        lp.dimAmount = 0f
+        diag("blur: using translucent background; global blur-behind disabled")
     }
 
     private fun widgetActive(): Boolean {
@@ -2178,22 +2165,12 @@ class CapsuleService : NotificationListenerService() {
         setStroke(dp(1), 0x22FFFFFF)
     }
 
-    // Requests blur behind the floating control panel using the overlay-window API.
+    // Avoid global blur-behind on the panel; retain its translucent background.
     private fun blurParams(params: WindowManager.LayoutParams, radius: Int) {
-        if (Build.VERSION.SDK_INT < 31) {
-            diag("panel blur: needs Android 12 or newer")
-            return
-        }
-        val result = runCatching {
-            WindowManager.LayoutParams::class.java
-                .getMethod("setBlurBehindRadius", Int::class.javaPrimitiveType)
-                .invoke(params, radius.coerceIn(1, 100))
-            params.flags = params.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND or
-                WindowManager.LayoutParams.FLAG_DIM_BEHIND
-            params.dimAmount = 0.04f
-        }
-        diag(if (result.isSuccess) "panel blur: blur-behind requested, radius $radius" else
-            "panel blur: setBlurBehindRadius unavailable (${result.exceptionOrNull()?.javaClass?.simpleName})")
+        params.flags = params.flags and WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
+        params.flags = params.flags and WindowManager.LayoutParams.FLAG_DIM_BEHIND.inv()
+        params.dimAmount = 0f
+        diag("panel blur: using translucent background; global blur-behind disabled")
     }
 
     private fun panelCols() = prefs.getInt("panelCols", 4).coerceIn(4, 7)
