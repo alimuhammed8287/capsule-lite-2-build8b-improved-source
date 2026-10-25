@@ -87,7 +87,9 @@ class CapsuleService : NotificationListenerService() {
     private lateinit var miniSpacer: View
     private lateinit var chargeBox: LinearLayout      // expanded charging pill
     private lateinit var chargeRing: View
-    private lateinit var chargeTime: android.widget.Chronometer
+    private lateinit var chargeTime: TextView
+    private lateinit var miniChargeRing: View
+    private var chargeEta = "ETA —"
     private lateinit var chargeTop: List<TextView>
     private lateinit var chargeBottom: List<TextView>
     private var chargeVolts = 0.0
@@ -763,9 +765,12 @@ class CapsuleService : NotificationListenerService() {
         chargeRing = ChargeRingView(uiCtx).apply {
             layoutParams = LinearLayout.LayoutParams(dp(40), dp(40)).apply { marginStart = dp(12) }
         }
-        chargeTime = android.widget.Chronometer(uiCtx).apply {
-            base = android.os.SystemClock.elapsedRealtime()
-            if (charging) start()
+        chargeTime = TextView(uiCtx).apply {
+            text = chargeEta
+            setTextColor(0xFFE6E6E6.toInt())
+            textSize = 12.5f
+            isSingleLine = true
+            ellipsize = TextUtils.TruncateAt.END
         }
         chargeTop = listOf(chargeTime, TextView(uiCtx), TextView(uiCtx))
         chargeBottom = listOf(TextView(uiCtx), TextView(uiCtx), TextView(uiCtx))
@@ -915,7 +920,12 @@ class CapsuleService : NotificationListenerService() {
                 setOnClickListener { runNotifAction(idx) }
             }
         }
+        miniChargeRing = ChargeRingView(uiCtx).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(24), dp(24)).apply { marginStart = dp(8); marginEnd = dp(2) }
+            visibility = View.GONE
+        }
         row.removeAllViews()
+        row.addView(miniChargeRing)
         row.addView(miniText)
         row.addView(miniSpacer)
         row.addView(miniRight)
@@ -987,24 +997,21 @@ class CapsuleService : NotificationListenerService() {
 
     private fun themeBackground() = GradientDrawable().apply {
         cornerRadius = dp(40).toFloat()
-        if (prefs.getBoolean("blur", false)) {
-            // Semi-transparent so the blurred background shows through
-            setColor(0x59000000)
-            setStroke(dp(1), 0x33FFFFFF)
-            return@apply
-        }
+        val blurEnabled = prefs.getBoolean("blur", false)
+        // Theme selection must remain independent from blur. Blur only adjusts translucency;
+        // it must never force every theme into the same translucent appearance.
         when (prefs.getString("theme", "black")) {
             "frosted" -> {
-                setColor(0xD9222226.toInt())
-                setStroke(dp(1), 0x33FFFFFF)
+                setColor(if (blurEnabled) 0x8C222226.toInt() else 0xD9222226.toInt())
+                setStroke(dp(1), 0x55FFFFFF)
             }
             "accent" -> {
-                setColor(0xF0000000.toInt())
+                setColor(if (blurEnabled) 0x99000000.toInt() else 0xF0000000.toInt())
                 setStroke(dp(2), uiCtx.getColor(android.R.color.system_accent1_200))
             }
             else -> {
-                setColor(Color.BLACK)
-                setStroke(dp(1), 0x22FFFFFF)
+                setColor(if (blurEnabled) 0xB8000000.toInt() else Color.BLACK)
+                setStroke(dp(1), if (blurEnabled) 0x44FFFFFF else 0x22FFFFFF)
             }
         }
     }
@@ -1380,6 +1387,7 @@ class CapsuleService : NotificationListenerService() {
     private fun updateChargeBox() {
         val ma = chargeMa
         val w = chargeWatts
+        chargeTop[0].text = chargeEta
         chargeTop[1].text = "%.1f V".format(chargeVolts)
         chargeTop[2].text = if (ma != null) "%.2f A".format(ma / 1000.0) else "— A"
         chargeBottom[0].text = "$chargePct%"
@@ -1983,8 +1991,21 @@ class CapsuleService : NotificationListenerService() {
             val r = size / 2f - stroke
             val cx = w / 2f
             val cy = h / 2f
-            box.set(cx - r, cy - r, cx + r, cy + r)
-            canvas.drawArc(box, spin, 290f, false, ringPaint)
+            // A continuous scalloped perimeter, matching the supplied charging reference.
+            // The phase moves around the perimeter like a travelling snake rather than spinning a broken arc.
+            val perimeter = android.graphics.Path()
+            val phase = Math.toRadians(spin.toDouble())
+            val points = 240
+            for (i in 0..points) {
+                val a = (i.toDouble() / points) * Math.PI * 2.0
+                val scallop = Math.sin(a * 12.0 + phase) * stroke * 0.72
+                val rr = r + scallop
+                val x = cx + Math.cos(a) * rr
+                val y = cy + Math.sin(a) * rr
+                if (i == 0) perimeter.moveTo(x.toFloat(), y.toFloat()) else perimeter.lineTo(x.toFloat(), y.toFloat())
+            }
+            perimeter.close()
+            canvas.drawPath(perimeter, ringPaint)
 
             val k = 0.85f + 0.15f * pulse
             val u = size * 0.30f
@@ -2605,11 +2626,13 @@ class CapsuleService : NotificationListenerService() {
         btnNext.visibility = vis(musicOn)
 
         val mapsMini = !hideAll && !expanded && mapsShown()
+        miniChargeRing.visibility = vis(chargeMini)
         miniText.visibility = vis(!hideAll && !expanded && (callActive || swOn || chargeMini || mapsMini))
         miniText.text = when {
             callActive -> if (callState == 2) "" else "Incoming"
             swOn -> "SW " + fmt(stopwatchElapsed())
             mapsMini -> mapsMiniText()
+            chargeMini -> ""
             else -> "\u26A1"   // the percentage is shown on the right of the camera hole
         }
         val k = prefs.getInt("textScale", 100) / 100f
@@ -3359,10 +3382,13 @@ class CapsuleService : NotificationListenerService() {
     }
 
     // Current in microamps, or null if no method gave a real (non-zero) value
-    private fun readCurrentUa(): Int? {
+    private fun readCurrentUa(intent: Intent? = null): Int? {
         val bm = getSystemService(BatteryManager::class.java)
         val fromApi = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
         if (fromApi != Int.MIN_VALUE && fromApi != 0) return fromApi
+        // Some OEMs publish current on ACTION_BATTERY_CHANGED even when the API property is empty.
+        val fromIntent = intent?.getIntExtra("current_now", 0) ?: 0
+        if (fromIntent != 0) return fromIntent
 
         // Vendors expose live current under different power-supply nodes.
         val dir = File("/sys/class/power_supply")
@@ -3392,14 +3418,6 @@ class CapsuleService : NotificationListenerService() {
         charging = plugged != 0 &&
             (status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL)
         chargePct = level * 100 / scale
-        if (::chargeTime.isInitialized) {
-            if (charging && !wasCharging) {
-                chargeTime.base = android.os.SystemClock.elapsedRealtime()
-                chargeTime.start()
-            } else if (!charging && wasCharging) {
-                chargeTime.stop()
-            }
-        }
         if (!charging) {
             chargeAlerted = false
             fullAlerted = false
@@ -3422,7 +3440,7 @@ class CapsuleService : NotificationListenerService() {
         }
 
         val parts = mutableListOf(source)
-        val currentUa = readCurrentUa()
+        val currentUa = readCurrentUa(i)
         chargeVolts = voltageMv / 1000.0
         chargeMa = currentUa?.let { (Math.abs(it.toLong()) / 1000L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt() }
         chargeWatts = if (currentUa != null && voltageMv > 0) Math.abs(voltageMv.toDouble() * currentUa.toDouble()) / 1e9 else null
@@ -3435,6 +3453,10 @@ class CapsuleService : NotificationListenerService() {
         parts.add("%.2f V".format(voltageMv / 1000.0))
         parts.add("%.1f\u00B0C".format(tempC))
         val ttf = getSystemService(BatteryManager::class.java).computeChargeTimeRemaining()
+        chargeEta = if (charging && ttf > 0) {
+            val mins = ttf / 60000L
+            if (mins >= 60) "ETA ${mins / 60}h ${mins % 60}m" else "ETA ${mins}m"
+        } else "ETA —"
         if (ttf > 0) parts.add("full in ${ttf / 60000} min")
         chargeDetail = parts.joinToString(" \u00B7 ")
         diag("battery: charging=$charging pct=$chargePct current=${currentUa ?: "unavailable"}uA voltage=${voltageMv}mV")

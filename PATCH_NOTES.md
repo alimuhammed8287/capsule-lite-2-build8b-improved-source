@@ -1,14 +1,13 @@
-Capsule Lite Build 8 — targeted improvement pass
+Capsule Lite Build 8 — follow-up charging/theme fixes
 
-Changes made in this source pass:
-- Changed blur from blur-behind (which can blur the entire screen) to window-background blur, for a localized overlay effect where supported by the device/OS.
-- Increased music transport controls from 40dp to 48dp.
-- Added a right-aligned spacer for the compact music visualizer.
-- Made notification body text multiline (up to 15 lines) and calculated expanded height from the body length, bounded by available screen height.
-- Intercepted downward notification swipes as an expand gesture so they don't dispatch a user-configured dismiss action; horizontal swipe-to-dismiss remains supported.
-- Added Fast / Medium / Slow liquid spring animation presets in Look settings and reduced the snapshot transition blur to reduce animation work.
-- Improved charging current lookup across common Android power-supply nodes and tightened charging text to reduce clipping.
+Changes in this pass:
+- Decoupled theme selection from blur. Black, frosted/translucent, and accent-outline themes now retain their own background/stroke choices even when blur is enabled.
+- Replaced the broken-arc charging indicator with a continuous scalloped perimeter whose wave phase travels around the edge, based on the supplied charging reference.
+- Added a second small animated charging ring for the collapsed pill; the expanded charging layout retains its larger ring.
+- Replaced the first expanded charging metric (elapsed chronometer) with an ETA label when Android provides a charge-time estimate.
+- Added an ACTION_BATTERY_CHANGED `current_now` fallback for devices where BatteryManager's current property returns no value.
 
-Important:
-- The requested charging “snake” animation has NOT been redesigned yet because the reference image/video has not been attached. Please share it so the motion and ring path can be matched accurately.
-- This environment did not have an Android SDK/Gradle installation, so the project could not be compiled or device-tested here. The included GitHub Actions workflow can build it after pushing the source to GitHub.
+Important limitations:
+- Actual charging current/amps/watts and ETA depend on what the phone's Android build exposes. Some manufacturers block current readings or do not provide a time-to-full estimate; those values will still show as unavailable on such devices.
+- Android overlay blur is OEM/version dependent. This pass prevents blur preference from overriding the selected theme, but it cannot guarantee true background blur on devices that disallow blur for overlay windows.
+- The project was not compiled or device-tested in this environment. Please build and test before treating these changes as verified.
